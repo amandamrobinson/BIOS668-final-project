@@ -1,0 +1,245 @@
+---
+title: "Pre-Transplant Biomarkers for Graft Failure in Kidney Transplant Recipients"
+subtitle: "BIOS668 Final Project"
+author: "Amanda Robinson"
+date: "May 5, 2025"
+# bibliography: reference.bib
+# csl: vancouver.csl
+output:
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, 
+                      message = FALSE)
+```
+
+# Introduction
+
+# Methods
+
+# Results
+
+## Pre-Processing 
+
+```{r pre-processing}
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(Azimuth)
+library(SeuratData)
+
+#Some process in here is random
+set.seed(12245)
+
+# Define your data directory, patients, and their outcomes
+data_dir <- paste0(getwd(), "/data/")
+samples <- list.files(path = data_dir, include.dirs = TRUE)
+
+# Function to import and format each sample as a Seurat object
+format_sample <- function(smpl){
+  
+  # 1. Read the Cell Ranger directory
+  data <- Read10X(data.dir = paste0(data_dir, smpl))
+  
+  # 2. Create the Seurat object
+  obj <- CreateSeuratObject(counts = data, project = "KidneyTransplant")
+  
+  # 3. Add metadata: Patient ID and Outcome
+  obj$patient_id <- smpl
+  obj$outcome <- ifelse(str_detect(smpl, "Fail"), "Graft_Failure", "Stable")
+  
+  obj
+  
+}
+
+# Create a list of Seurat objects
+seurat_list <- map(samples, format_sample)
+
+# 4. Merge into one combined object
+pbmc <- merge(seurat_list[[1]], 
+              y = seurat_list[2:length(seurat_list)], 
+              add.cell.ids = samples)
+```
+
+## Quality Control
+
+```{r distributions}
+fig.num <- 1
+
+# 1. Calculate mitochondrial percentage
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+mt_summary <- pbmc@meta.data %>%
+  group_by(patient_id) %>%
+  summarize(median_mt = median(percent.mt),
+            mad_mt = mad(percent.mt),
+            upper_limit = median_mt + (3 * mad_mt))
+
+f_summary <- pbmc@meta.data %>%
+  group_by(patient_id) %>%
+  summarize(median_f = median(nFeature_RNA),
+            mad_f = mad(nFeature_RNA),
+            lower_limit = median_f - (3 * mad_f),
+            upper_limit = median_f + (3 * mad_f))
+
+# mt_summary
+# f_summary
+
+#Identify the max upper limit across patients to use for filtering
+mt_cap <- ceiling(max(mt_summary$upper_limit))
+
+# 2. Visualize QC metrics to decide on filtering cutoffs
+vp <- VlnPlot(pbmc, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3, 
+        group.by = "patient_id", 
+        alpha = 0.2)
+
+samples_clean <- paste0(str_replace(samples, "_", " ("), ")")
+
+vp[[1]] <- vp[[1]] + 
+  labs(title = "Genes per Cell", x = "") +
+  scale_x_discrete("", labels = samples_clean)
+
+vp[[2]] <- vp[[2]] + 
+  labs(title = "Molecules per Cell", x = "") +
+  scale_x_discrete("", labels = samples_clean)
+
+vp[[3]] <- vp[[3]] + 
+  geom_hline(yintercept = mt_cap, linetype = "dashed") +
+  labs(title = "% Mitochondria", x = "") +
+  scale_x_discrete("", labels = samples_clean)
+
+vp +
+  plot_annotation(title = paste0("Figure ", fig.num, 
+                                 ": Pre-Filtering Quality Control Metrics"))
+```
+
+```{r feature-plot}
+fig.num <- fig.num + 1
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt", 
+                        group.by = "patient_id")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", 
+                        group.by = "patient_id")
+plot1 + plot2
+```
+
+```{r filter}
+# 3. Subset data to cells with less than the calculated cap mitochondrial reads,
+#    more than 200 genes detected, and fewer than the patient-specific gene cap
+pbmc <- subset(pbmc, 
+               subset = percent.mt < mt_cap &
+                          nFeature_RNA > 200 & 
+                          ((patient_id == samples[1] & 
+                              nFeature_RNA < f_summary$upper_limit[1]) |
+                           (patient_id == samples[2] & 
+                             nFeature_RNA < f_summary$upper_limit[2]) |
+                           (patient_id == samples[3] & 
+                             nFeature_RNA < f_summary$upper_limit[3]) |
+                           (patient_id == samples[4] & 
+                             nFeature_RNA < f_summary$upper_limit[4])))
+```
+
+## Normalization 
+
+```{r normalization}
+pbmc <- SCTransform(pbmc, 
+                    vars.to.regress = "percent.mt",
+                    verbose = FALSE)
+```
+
+## Data Reduction
+
+```{r pca}
+pbmc <- RunPCA(pbmc, assay = "SCT")
+```
+
+## Data Integration and Clustering
+
+```{r unintegrated-umap}
+fig.num <- fig.num + 1
+
+pbmc <- FindNeighbors(pbmc, dims = 1:30, reduction = "pca")
+pbmc <- FindClusters(pbmc, resolution = 2)
+pbmc <- RunUMAP(pbmc, dims = 1:30, reduction = "pca", 
+                reduction.name = "umap.unintegrated")
+
+# 1. Create the Patient UMAP with your custom labels
+p1 <- DimPlot(pbmc, reduction = "umap.unintegrated", group.by = "patient_id") + 
+  scale_color_discrete(name = "Patient", labels = samples_clean) +
+  labs(title = "Patient",
+       x = "UMAP1", 
+       y = "UMAP2") +
+  theme(legend.position = "right")
+
+# 2. Create the Cluster UMAP
+p2 <- DimPlot(pbmc, reduction = "umap.unintegrated", 
+              group.by = "seurat_clusters", label = TRUE) + 
+  labs(title = "Cluster", 
+       x = "UMAP1", 
+       y = "UMAP2") +
+  theme(legend.position = "right")
+
+(p1 | p2) + 
+  plot_annotation(title = paste0("Figure ", fig.num, 
+                                 ": Pre-Integration UMAP Visualization"))
+```
+
+```{r harmonize}
+fig.num <- fig.num + 1
+
+pbmc <- IntegrateLayers(object = pbmc, 
+                        method = HarmonyIntegration, 
+                        orig.reduction = "pca", 
+                        new.reduction = "integrated.harmony",
+                        verbose = FALSE)
+
+# re-join layers after integration
+# pbmc[["SCT"]] <- JoinLayers(pbmc[["SCT"]])
+
+pbmc <- FindNeighbors(pbmc, reduction = "integrated.harmony", dims = 1:30)
+pbmc <- FindClusters(pbmc, resolution = 0.4)
+pbmc <- RunUMAP(pbmc, dims = 1:30, reduction = "integrated.harmony", 
+                reduction.name = "umap.harmony")
+
+# 1. Create the Patient UMAP with your custom labels
+p1 <- DimPlot(pbmc, reduction = "umap.harmony", group.by = "patient_id") + 
+  scale_color_discrete(name = "Patient", labels = samples_clean) +
+  labs(title = "Patient",
+       x = "UMAP1", 
+       y = "UMAP2") +
+  theme(legend.position = "right")
+
+# 2. Create the Cluster UMAP
+p2 <- DimPlot(pbmc, reduction = "umap.harmony", 
+              group.by = "seurat_clusters", label = TRUE) + 
+  labs(title = "Cluster", 
+       x = "UMAP1", 
+       y = "UMAP2") +
+  theme(legend.position = "right")
+
+(p1 | p2) + 
+  plot_annotation(title = paste0("Figure ", fig.num, 
+                                 ": Post-Integration UMAP Visualization"))
+```
+
+## Annotation
+
+```{r annotate}
+
+```
+
+## Visualization
+
+```{r visualize}
+
+```
+
+#Conclusion
+
