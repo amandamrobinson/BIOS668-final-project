@@ -31,7 +31,6 @@ library(tidyverse)
 library(Seurat)
 library(patchwork)
 library(Azimuth)
-library(SeuratData)
 
 #Some process in here is random
 set.seed(12245)
@@ -158,16 +157,20 @@ pbmc <- SCTransform(pbmc,
 
 ```{r pca}
 pbmc <- RunPCA(pbmc, assay = "SCT")
+
+# Run this to see the elbow for your data
+ElbowPlot(pbmc)
 ```
 
 ## Data Integration and Clustering
 
+
 ```{r unintegrated-umap}
 fig.num <- fig.num + 1
 
-pbmc <- FindNeighbors(pbmc, dims = 1:30, reduction = "pca")
+pbmc <- FindNeighbors(pbmc, dims = 1:10, reduction = "pca")
 pbmc <- FindClusters(pbmc, resolution = 2)
-pbmc <- RunUMAP(pbmc, dims = 1:30, reduction = "pca", 
+pbmc <- RunUMAP(pbmc, dims = 1:10, reduction = "pca", 
                 reduction.name = "umap.unintegrated")
 
 # 1. Create the Patient UMAP with your custom labels
@@ -203,9 +206,9 @@ pbmc <- IntegrateLayers(object = pbmc,
 # re-join layers after integration
 # pbmc[["SCT"]] <- JoinLayers(pbmc[["SCT"]])
 
-pbmc <- FindNeighbors(pbmc, reduction = "integrated.harmony", dims = 1:30)
-pbmc <- FindClusters(pbmc, resolution = 0.4)
-pbmc <- RunUMAP(pbmc, dims = 1:30, reduction = "integrated.harmony", 
+pbmc <- FindNeighbors(pbmc, reduction = "integrated.harmony", dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.6)
+pbmc <- RunUMAP(pbmc, dims = 1:10, reduction = "integrated.harmony", 
                 reduction.name = "umap.harmony")
 
 # 1. Create the Patient UMAP with your custom labels
@@ -232,14 +235,84 @@ p2 <- DimPlot(pbmc, reduction = "umap.harmony",
 ## Annotation
 
 ```{r annotate}
+fig.num <- fig.num + 1
+## Final Annotation and Consensus Consolidation
 
+# 1. Run the Azimuth Mapping engine
+pbmc <- RunAzimuth(pbmc, reference = "pbmcref")
+
+# 2. Ensure we are looking at the CLUSTERS before renaming
+# This is the "Safety Reset"
+Idents(pbmc) <- "seurat_clusters"
+
+# 3. Generate the Consensus Labels (The "Majority Vote")
+target_labels <- pbmc@meta.data %>%
+  group_by(seurat_clusters) %>%
+  filter(!is.na(predicted.celltype.l2)) %>%
+  count(predicted.celltype.l2) %>%
+  slice_max(n = 1, order_by = n) %>%
+  ungroup()
+
+# 4. Create the mapping vector (Explicitly ensure they are characters)
+annotation_map <- as.character(target_labels$predicted.celltype.l2)
+names(annotation_map) <- as.character(target_labels$seurat_clusters)
+
+# 5. Apply the rename
+# Since we ran Idents(pbmc) <- "seurat_clusters", it WILL find them now
+pbmc <- RenameIdents(pbmc, annotation_map)
+
+# 6. Save the result
+pbmc$cell_type <- Idents(pbmc)
+
+# 7. Final Visualization
+fig.num <- fig.num + 1
+DimPlot(pbmc, reduction = "umap.harmony", label = TRUE, label.size = 3.5, repel = TRUE) + 
+  theme_minimal() +
+  labs(title = paste0("Figure ", fig.num, ": Consensus Cell Type Annotation")) #+
+  #NoLegend()
 ```
 
-## Visualization
+```{r}
+# 1. Create the data frame from your 6 cell types
+# Note: Ensure 'cell_type' is the column with your 6 consensus labels
+df <- as.data.frame(table(pbmc$outcome, pbmc$cell_type)) 
+colnames(df) <- c("Outcome", "CellType", "Count")
 
-```{r visualize}
+# 2. Calculate proportions so the bars are all the same height (100%)
+library(dplyr)
+df <- df %>%
+  group_by(CellType) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup()
 
+# 3. Plot with the corrected theme syntax
+library(ggplot2)
+ggplot(df, aes(x = CellType, y = Proportion, fill = Outcome)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Graft_Failure" = "#E41A1C", "Stable" = "#377EB8")) +
+  labs(title = "Proportional Shift in Cell Types",
+       subtitle = "Comparing Graft Failure vs. Stable Patient PBMCs",
+       y = "Fraction of Cells (Normalized)",
+       x = "Annotated Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
 ```
 
-#Conclusion
+```{r, eval = FALSE, include = FALSE}
+# 1. Prepare the SCT offset models for differential expression
+pbmc <- PrepSCTFindMarkers(pbmc)
+
+# 2. Now run the marker test again
+mono_markers <- FindMarkers(pbmc, 
+                            ident.1 = "Graft_Failure", 
+                            group.by = "outcome", 
+                            subset.ident = "CD14 Mono",
+                            assay = "SCT",
+                            recorrect_umi = FALSE) # This matches the new Seurat v5 workflow
+
+# 3. Look at the "Victory" list
+head(mono_markers[order(mono_markers$avg_log2FC, decreasing = TRUE), ], n = 10)
+```
+
+# Conclusion
 
